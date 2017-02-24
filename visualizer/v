@@ -1,0 +1,867 @@
+#!/usr/bin/perl
+
+#########################################################################
+#									#
+#    v		         					        #
+#									#
+#########################################################################
+#									#
+# created by Yoginho, Nov 1, 2001                                       #
+#                                                                       #
+# v displays data and model output produced by the Reinitz lab gene     #
+# circuit code (unfold/printscore). v produces spatial plots for        #
+# specific times and time classes.                                      #
+#                                                                       #
+# See help message at the bottom of this file for a more detailed des-  #
+# cription or type 'v -h' on the command line.                          #
+#                                                                       #
+#########################################################################
+#                                                                       #
+# IMPORTANT: change the name of the unfold/printscore executable that   #
+#            would like in the source code below!!!                     #
+#                                                                       #
+#########################################################################
+
+
+
+### modules ####################################################################
+
+use strict;                             # use strict c-style declarations
+
+use Getopt::Std;                        # Getopt reads command line ops
+use IO::File;                           # for temp file handles
+use POSIX qw(tmpnam);                   # for temp files
+use File::Basename;                     # for file basename
+
+use Lsa::Data     9.50;                 # Lsa-specific packages
+use Lsa::Embryo   9.50;                 # use perldoc for info on these
+use Lsa::Fly      9.50;                 # e.g. 'perldoc Lsa::Fly'
+
+use GPlot         0.90;                 # Yogi's Perl-gnuplot interface
+
+
+
+### initialize variables #######################################################
+
+#-- current version information ------------------------------------------------
+
+my $version = "3.8";
+my $modby   = "Yoginho";
+my $lastmod = "Monday, Apr 15, 2009";
+
+
+#-- names of unfold/printscore executables -------------------------------------
+
+# KLUDGE ALARM!!!!!
+# IMPORTANT: specify the unfold ($unf) and printscore ($printsc) 
+# executables here
+
+my $unf = "visualizer/unfold"; my $printsc = "visualizer/printscore";
+
+
+#-- command line options for getopts -------------------------------------------
+
+our $opt_a = "N/A";                     # accuracy of adaptive stepsize solvers
+our $opt_b = 0;                         # display bcd?
+our $opt_c = "";                        # choose genes
+our $opt_d = 0;                         # plot data instead of model output
+our $opt_D = 0;                         # debugging mode
+our $opt_g = "N/A";                     # for choosing g(u)
+our $opt_G = 0;                         # plot printscore guts
+our $opt_h = 0;                         # flag for printing help message
+our $opt_i = "N/A";                     # solver stepsize: default from fly_sa
+our $opt_j = "";                        # file to read tab times from
+our $opt_o = 0;                         # oldstyle value range [0-12]
+our $opt_O = "disp";                    # output mode (disp, eps, fig, png...)
+our $opt_p = "";                        # output stepsize
+our $opt_P = "lines";                   # plot style
+our $opt_q = "N/A";                   	# section
+our $opt_r = "N/A";                     # right hand side of equation
+our $opt_s = "N/A";                     # solver type
+our $opt_S = "large";                   # set output size
+our $opt_t = "";                        # output time
+our $opt_v = 0;                         # version command line flag
+our $opt_x = "";                        # x-axis limits
+our $opt_X = 0;                         # shows grid in graphs
+our $opt_y = "";                        # y-axis limits
+
+
+#-- other globals --------------------------------------------------------------
+
+my $i;                                  # loop counter
+
+my $infile;                             # name of input file
+my($temptimes,$th);                     # tmp filename for times
+
+my %arghash;                            # hash with plot_out arguments
+
+my @data;                               # data/model output to be plotted
+my(@bcd, @cyclebcd);                    # bcd gradient
+my @times;                              # list of output times
+
+my $ngenes = 0;                         # number of genes in datafile
+my($geneID, $dispID);                   # gene and display ID strings
+my @garray;                             # indices of genes to be plotted
+my $genotype = "";                      # genotype string
+
+my $basetitle;                          # used for formatting title
+my $ftime;                              # formatted time string
+my $ccycle;                             # current cleavage cycle
+
+
+#-- usage message (see end of script for a longer help message) ----------------
+
+my $usage = 
+"Usage: v [-a <accuracy>] [-b] [-c <geneID>] [-d <temporal class>] [-D] [-g <g(u)>] 
+         [-G] [-h] [-i <stepsize>] [-j <timefile>] [-o] [-O <output_mode>]
+         [-p <output_stepsize>] [-P <plotstyle>] [-q <section>] [-r <RHS>] [-s <solver>]
+         [-S <size>] [-t <time>] [-v] [-x <xmin,xmax>] [-X] [-y <ymin,ymax>] 
+         <datafile> [<genotype>]
+"; 
+
+
+
+### main program ###############################################################
+#   first set up temporary files and parse the command line
+
+#-- install a tmp file which we use to store plotting times below --------------
+#   NOTE: this needs to be right here, otherwise -h and -v will barf
+
+# try new temp filenames until we get a novel one
+do { $temptimes = tmpnam() }
+until $th = IO::File->new($temptimes, O_RDWR|O_CREAT|O_EXCL);
+
+# install atexit-style handler so that when we exit or die
+# we automatically delete this temporary file
+END { unlink($temptimes) or die "v: couldn't unlink $temptimes : $!" }
+
+
+#-- parse command line options -------------------------------------------------
+
+getopts('a:bc:d:Dg:Ghi:j:oO:p:P:q:r:s:S:t:vx:Xy:');
+
+# this hash is for options that are passed on to unfold/printscore
+my %uopts = ( a => $opt_a,
+	      g => $opt_g,
+	      i => $opt_i,
+	     q	=> $opt_q,
+	      r => $opt_r,
+	      s => $opt_s,
+	      z => 0 );
+
+# first deal with -v and -h
+
+if ( $opt_v ) {                         # if -v just print message and quit
+    print STDERR "This is v$version, last modified by $modby, on $lastmod.\n";
+    exit(0);
+}
+if ( $opt_h ) {                         # -h prints help message
+    print_help_msg();
+    exit(0);
+}
+
+# command line options error checking 
+
+# NOTE that the validity of -O, -P and -S arguments is checked in GPlot.pm
+# -a, -g, -i, -q, -r and -s are checked within unfold/printscore
+# -t, -p and -j validity check is done in make_timetable below
+
+if ( $opt_p ne "" && $opt_p < 0.001 ) {
+    die "v: -p argument of $opt_p too small (min. is 0.001)\n"; } 
+
+if ( $opt_d && ( $opt_j || $opt_p || $opt_t ) ) {
+    die "v: you can't use -d in combination with -j, -p or -t.\n"; }
+
+if ( ($opt_j && $opt_p) || ($opt_j && $opt_t) || ($opt_p && $opt_t) ) {
+    die "v: you can only use one of either -j, -p or -t at a time.\n"; }
+
+if ( $opt_G && ( $opt_p || $opt_t || $opt_j || $opt_d )) {
+    die "v: you can't use -G in combination with -d, -j, -p, or -t.\n"; }
+
+
+#-- parse command line arguments -----------------------------------------------
+
+if ( @ARGV > 2 || @ARGV < 1 ) {
+    print STDERR "$usage";
+    exit(1);
+}
+
+# first argument is the data file
+$infile   = $ARGV[0];
+$infile =~ s{ ^ ~ ( [^/]* ) } # substitute tilde so that open can understand it
+            { $1                        
+                  ? (getpwnam($1))[7]
+		  : ( $ENV{HOME} || $ENV{LOGDIR}
+                       || (getpwuid($>))[7]
+                     )
+	    }ex;
+
+# get info about the genes in our datafile
+($ngenes, $geneID) = (get_problem($infile))[0..1]; 
+
+# if no genotype: construct wt string according to number of genes
+if ( @ARGV == 2 ) { $genotype = $ARGV[1]; }
+else              { $genotype = 0; }
+#else              { $genotype = 'W' x $ngenes; }
+
+### prepare times, data and plotting options ###################################
+
+#-- general program and plotting options ---------------------------------------
+
+$arghash{"dbugflag"} = $opt_D;    # debug mode?
+
+$arghash{"nogrid"}   = $opt_X;    # grid or no grid?
+$arghash{"plotmode"} = $opt_P;    # set plot mode: lines etc.
+$arghash{"mode"}     = $opt_O;    # set output mode: disp, fig etc.
+$arghash{"size"}     = $opt_S;    # set plot size
+
+
+#-- set up unfold/printscore command line options ------------------------------
+#   this is done by checking the $version section of $infile for the 
+#   default options used when the circuit was optimized; these
+#   default options are then combined with explicit v command 
+#   line options; v command line options ALWAYS have precedence
+#   over $version options
+%uopts = make_opts($infile, \%uopts);
+
+
+#-- make a time table for the output loop below --------------------------------
+#   here we also check for the correctness of time(s)
+@times  = make_timetable();
+
+
+#-- get data for all requested times and genes ---------------------------------
+
+# first parse and do consistency check for $opt_c, this is done as follows:
+# make_dispID compares -c and $geneID strings and creates 
+#   the $dispID string which is
+#   (a) identical to $opt_c if all requested genes are present
+#   (b) an explicit gene ID string if $opt_c was 'gap' or 'pair'
+#   (c) equal to the entire geneID string if $opt_c was empty
+$dispID = make_dispID($opt_c, $geneID);
+
+# make_gindices then creates an array of indices which points 
+#   to the elements of $geneID in the order they appear in $dispID
+#   e.g. $geneID = HKGT, $dispID = GHT, @garray = (2,0,3)
+@garray = make_gindices($dispID, $geneID);
+if ( $opt_b ) { $dispID = "B" . $dispID; }
+
+# then get the data from unfold/printscore or the datafile $facts section
+unless ( $opt_d ) {
+    @data = run_command(\@times, \%uopts);
+    $arghash{"thick"} = "2";
+} else {
+    @data = get_facts($genotype, $infile);
+    $arghash{"thick"} = ".5";
+} 
+
+# extract the right genotype from -G guts
+if ( $opt_G ) { @data = extract_genotype($genotype, \@data); }
+
+# filter out the genes we don't want
+@data = get_gene_data(\@garray, \@data);
+
+# convert lineage number to AP position in %
+@data = convert_lin(\@data);
+
+# get bcd if needed (-b)
+if ( $opt_b ) { @bcd = get_bcd($genotype, $infile); }
+
+
+#-- set plot title, axis labels & limits, and the key of the plot --------------
+
+$basetitle  = "File: " . basename($infile) . "    ";
+
+$arghash{"xlabel"} = "A-P Position (%)";
+$arghash{"xlim"}   = set_xlimits($infile);
+
+$arghash{"ylabel"} = "Rel. [Prot]";
+$arghash{"ylim"}   = set_ylimits();
+
+$arghash{"key"} = [(parse_geneID($dispID))];
+
+
+
+### loop over requested times and display plots ################################
+
+foreach ( @times ) {
+
+    # extract data for the current time
+    $arghash{"data"} = [(get_time_data($_, \@data))];
+
+    # add the corresponding BCD gradient if necessary
+    if ( $opt_b ) { 
+	$ccycle = get_ccycle($_, (get_problem($infile))[2], $uopts{"o"});
+	@cyclebcd = get_cyclebcd($ccycle, \@bcd);
+	$arghash{"data"} = [(add_bcd(\@cyclebcd, $arghash{"data"}))]; 
+    }
+
+    # get rid of comment lines and the time column (which we don't plot)
+    $arghash{"data"} = [(strip_time($arghash{"data"}))];
+    
+    # set key title and name for safe file (nicely formatted)
+    $ftime = sprintf("%6.2f", $_);
+    # $arghash{"title"} = $basetitle . "Time: $ftime";
+    $arghash{"title"} = "Time: $ftime";
+    $ftime = format_time($_);
+    $arghash{"savefile"} = "$infile\_$opt_O/$dispID\.$ftime";
+    
+    # do the actual plotting here
+    gplot(\%arghash);
+}
+
+exit(0);
+
+
+
+### subroutines ################################################################
+
+### set_xlimits: sets x-axis limits for plotting ###############################
+
+sub set_xlimits {
+
+    my($lin, $nnucs, @xlim, @optx);
+    my($infile)=$_[0];
+
+# the following gets the lineage number of the anterior-most nucleus
+# and the number of nuclei at cycle 14 and then calculates suitable
+# plotting limits which start at -0.5 of the anterior-most AP-position
+# and ends +0.5 of the posterior-most nuclear AP-position   
+
+    $lin = get_lin($infile);               # get ant-most lineage num at cycle 14
+    $nnucs = (get_problem($infile))[3];    # get number of nuclei at cycle 14
+    @xlim = ($lin-8192, $lin+$nnucs-8192); # calculate x limits in % AP Pos.
+
+# check whether limits were supplied by -x
+# if yes, check their validity
+
+    if ( $opt_x ne "" ) {
+	@optx = split ',', $opt_x;
+	if ( $optx[0] < $xlim[0] ) { 
+	    die "x-min is out of range (min. $xlim[0])"; }
+	if ( $optx[1] > $xlim[1] ) {
+	    die "x-max is out of range (max. $xlim[1])"; } 
+	@xlim = @optx;
+    }
+
+    return \@xlim;
+}
+
+
+### set_ylimits: sets y-axis limits for plotting ###############################
+
+sub set_ylimits {
+
+    my(@ylim);
+
+#-- case 1: use defaults -------------------------------------------------------
+
+    if ( $opt_y eq "" ) {
+
+	$ylim[0] = 0.;
+
+	if ( $opt_G ) {                     
+	    if ( $opt_o ) { $ylim[1] = 50.; } 
+	    else          { $ylim[1] = 5000.; }
+	} else {
+	    if ( $opt_o ) { $ylim[1] = 12.; }                   
+	    else          { $ylim[1] = 255.; }
+	}
+
+#-- case 2: use -y -------------------------------------------------------------
+
+    } else {
+
+	@ylim = split ',', $opt_y;
+
+	# do some error checkin
+	if ( $ylim[0] > $ylim[1] ) { die "y-min must be smaller than y-max"; }
+	if ( $ylim[0] < 0 )        { die "y-min must be zero or larger"; }
+    }
+    
+    return \@ylim;
+}
+
+
+### make_timetable: returns an array of times for which we display stuff #######
+
+sub make_timetable {
+
+    my($i,$t);
+    my(@facts, @times); 
+    my($ndivs)=(get_problem($infile))[2];
+    my($gasttime)=get_gasttime($ndivs, $uopts{"o"});
+
+# -j: read times from times file
+
+    if ( $opt_j ne "" ) {               
+	$opt_j =~ s{ ^ ~ ( [^/]* ) }    # substitute tilde so that open can
+                   { $1                 # understand it
+                         ? (getpwnam($1))[7]
+		         : ( $ENV{HOME} || $ENV{LOGDIR}
+                              || (getpwuid($>))[7]
+                            )
+	           }ex;
+	chomp(@times = load_data($opt_j));
+
+# -p: make time table with increment
+
+    } elsif ( $opt_p != 0 ) {           
+	for ( $t=0, $i=0; $t<=$gasttime; $t+=$opt_p ) {
+	    $times[$i++] = $t; }
+	if ( sprintf("%.3f", $times[$#times]) != $gasttime ) {
+	    $times[$#times+1] = $gasttime; }
+
+# -t: print output for single time (or all data times)
+
+    } elsif ( $opt_t ) {                
+	if ( $opt_t eq "all" ) {
+	    @facts=get_facts($genotype, $infile);
+	    @times=get_datatimes(\@facts);
+	} elsif ( $opt_t =~ /^[^0-9\.]/ ) { 
+	    $times[0]=t2time($opt_t, $ndivs);
+	} else {
+	    $times[0]=$opt_t;
+	}
+
+# -d: establish times for data analogous to -t
+
+    } elsif ( $opt_d ) {
+	if ( $opt_d eq "all" ) {            # parse the -d argument 
+	    @facts=get_facts($genotype, $infile);
+	    @times=get_datatimes(\@facts);
+	} elsif ( $opt_d =~ /^[^1-9\.]/ ) {
+	    $times[0]=t2time($opt_d, $ndivs);
+	} else {
+	    $times[0]=$opt_d;
+	}
+
+# default: print model output at gasttime or guts at all datatimes
+
+    } else {                            
+	unless ( $opt_G ) {
+	    $times[0] = $gasttime;
+	} else {
+	    @facts=get_facts($genotype, $infile);
+	    @times=get_datatimes(\@facts);
+	}
+    }                                  
+
+# do consistency test for times
+
+    check_times(\@times);
+
+    return @times;
+}
+
+
+### check_times: checks consistency and validity of @times #####################
+
+sub check_times {
+
+    my(@t) = @{$_[0]};                  # local @times array           
+    my(@dt, @facts);                    # arrays for data times and facts 
+    my($time, $dtime, $t);              # loop variables
+    my($ndivs)=(get_problem($infile))[2];
+    my($gasttime)=get_gasttime($ndivs, $uopts{"o"});
+
+# check if @times contains ascending series of time between 0 and gasttime
+
+    for ($t=0; $t<@t; $t++) { 
+	if ( $t[$t] < 0 ) { 
+	    die "v: cannot plot for times before start (t=0).\n"; }
+	elsif (($t > 0) && ($t[$t] < $t[$t-1])) {
+	    die "v: plotting times must be in ascending order.\n"; }
+	elsif ( $t[$t] > $gasttime && $t[$t] > $uopts{"z"} ) {
+	    $uopts{"z"} = $t[$t];
+	    if ( $t[$t] > 10000. ) { 
+		die "v: can't plot beyond t=10'000 min!\n"; }
+	}
+    }
+
+# if we plot data: check that all @times actually have data
+
+    if ( $opt_d ) {
+	@facts = get_facts($genotype, $infile);
+	@dt    = get_datatimes(\@facts);
+	unshift @dt, "0.0";             # we can also plot bias data
+    
+        TIME: foreach $time ( @t ) {
+            foreach $dtime ( @dt ) {
+	        if ( $time == $dtime ) { next TIME; } }
+            die "v: we don't have any data for $time.\n" 
+        }
+    }
+}
+
+
+### run_command: runs the appropriate unfold/printscore command ################
+
+sub run_command {
+
+    my(@times)=@{$_[0]};            # requested times
+    my(%opts)=%{$_[1]};             # command line options for cmd
+    my(@output,$cmd);               # array for unfold output and command
+
+# guts or no guts? that is the question...
+
+    if ( $opt_G ) { $cmd = "$printsc -G "; } 
+    else {          $cmd = "$unf "; }
+
+# set command line options from %opts array
+
+    if ( defined($opts{"a"}) ) { $cmd .= "-a $opts{'a'} "; }
+    if ( defined($opts{"g"}) ) { $cmd .= "-g $opts{'g'} "; }
+    if ( defined($opts{"i"}) ) { $cmd .= "-i $opts{'i'} "; }
+    if ( defined($opts{"o"}) ) { $cmd .= "-o "; }
+    if ( defined($opts{"q"}) ) { $cmd .= "-x $opts{'q'} "; }
+    if ( defined($opts{"r"}) ) { $cmd .= "-r $opts{'r'} "; }
+    if ( defined($opts{"s"}) ) { $cmd .= "-s $opts{'s'} "; }
+
+    #if ( !$opt_G )             { $cmd .= "-z $opts{'z'} "; }
+
+# plotting unfold guts? 
+
+    if ( $opt_G ) { $cmd = $cmd . " $infile"; }
+
+# ... or model output?
+
+    else {
+
+# if only one requested time: use -t
+
+	if ( @times == 1 ) {
+	    $cmd = $cmd . "-t $times[0] $infile $genotype";
+	    
+	} else {
+	    
+# if multiple requested times: write times into temporary file and let 
+# unfold read it using -j
+
+	    open ( T, ">$temptimes" ) 
+		|| die("v: could not create temporary times file!\n");
+	    foreach ( @times ) {
+		$_ = sprintf("%.3f", $_); 
+		print T "$_\n"; }
+	    close( T );
+	    
+	    $cmd = $cmd . "-j $temptimes $infile $genotype";
+	}
+    } 
+
+# run command and return its output
+
+    #debug mode
+    if ( $opt_D ) { 
+	print "\nCommand executed by v: $cmd\n\n";
+	print "Scheduled times:\n\n";
+	foreach ( @times ) { print "$_\n"; }
+	print "\n";
+    }
+	
+    @output = `$cmd`;
+	
+# check if anything was returned
+
+    if ( @output == 0 ) {
+	die "v: error executing command: returned array is empty.\n"; 
+    }
+	
+    return @output;
+}
+
+
+### extract_genotype: extract the correct genotype from printscore -G output ###
+
+sub extract_genotype {
+    my($genotype)=$_[0];
+    my(@in_data)=@{$_[1]};
+    my($i, $j, @out_data);
+
+    for ($i=0; $i<@in_data; $i++) {
+	if ( $in_data[$i] =~ /^\$$genotype/) { last; } 
+    }
+
+    while ($in_data[$i] !~ /\$\$/) {
+	$out_data[$j++]=$in_data[$i++];
+    }
+    $out_data[$j]=$in_data[$i];
+    return @out_data;
+}
+
+
+### format_time: formats the time nicely for the filenames of saved graphs #####
+
+sub format_time {
+    my($time)=$_[0];
+    my($ftime);
+    $ftime = sprintf("%07.3f", $time);          # right-align with zeros
+    if ( $opt_d ) { $ftime = $ftime . '.d'; }  # append a .d when saving data
+    if ( $opt_G ) { $ftime = $ftime . '.g'; }  # append a .g when saving guts
+    if ( $opt_t ) { $ftime = $ftime . '.t'; }  # append a .t when saving guts
+    return $ftime;
+}
+
+
+### add_bcd: get Bicoid gradient for current time and add it to data array #####
+
+sub add_bcd {
+
+    my(@bcd)  = @{$_[0]};
+    my(@data) = @{$_[1]};
+    my(@line, $newline, $count, @out_data);
+    my($i, $j)=0;
+
+
+    foreach ( @data ) {
+	s/^\s+//;
+	if ( /^\d/ ) {
+	    @line = split / /;
+	    $newline = ' ' . sprintf("%4.1f %7.3f", $line[0], $line[1]);
+	    $newline .= sprintf("  %6.2f", $bcd[$i++]);
+	    $count=2;
+	    until ($line[$count+1] eq "") {
+		$newline .= sprintf("  %6.2f", $line[$count++]);
+	    }
+	    $out_data[$j++] = $newline . "\n";
+	}
+    }
+
+    return @out_data;
+}
+
+
+### make_dispID: returns a geneID string of genes to display ###################
+
+sub make_dispID {
+
+    my($oc)  = $_[0];                # -c argument string
+    my($gid) = $_[1];                # geneID string from datafile
+    my(@ids,  $id);                  # used to parse gene ID string
+    my(@cids, $cid);                 # used to parse -c argument string
+    my($i);
+
+# 1. the user has chosen a gene string with -c
+
+    $cid = "";
+    if ( $oc ) {                     # if -c was specified
+	@cids = split //, $oc;       # split both -c arg and geneID strings 
+	@ids  = split //, $gid;      # into character arrays
+
+# special cases: -c gap and -c pr -> check for gap/pair-rule genes in $gid
+
+	if ( $oc eq "gap" ) {     
+	    for ($i=0; $i<@ids; $i++) {
+		if ( $ids[$i] =~ /^[HKGNT]$/ ) { 
+		    $cid .= $ids[$i]; } }
+	    if ( $cid eq "" ) { die "no gap genes found!\n"; }
+	} elsif ( $oc eq "pair" ) {
+	    for ($i=0;$i<=$#ids;$i++) {
+		if ( $ids[$i] =~ /^[EIRFPO]$/ ) { $cid .= $ids[$i]; } }
+	    if ( $cid eq "" ) { die "no pair-rule genes found!\n"; }
+
+# otherwise: make sure -c IDs are present in datafile and put them into $cid
+
+	} else {
+	    foreach $id (@cids) { 
+		if ( $id !~ /^[$gid]$/io ) {
+		    die "gene $id cannot be found!\n"; } }
+	    $cid = $oc;
+	}
+	return $cid;
+    }
+# 2. no -c: just display all genes in datafile
+
+    return $gid;
+}
+
+
+### make_gindices: returns an array of indices of genes to be displayed ########
+
+sub make_gindices {
+
+    my($i,$j);                   # loop counters
+    my($dID) = $_[0];            # display ID string
+    my($gID) = $_[1];            # gene ID string
+    my(@dids, @gids, @gind, $i); # dispID, geneID, gene index arrays
+
+    @dids = split //, $dID;      # split both -dispID and geneID strings 
+    @gids = split //, $gID;      # into character arrays
+    
+    for ( $i=0; $i<@dids; $i++ ) {
+	for ( $j=0; $j<@gids; $j++) {
+	    if ( $dids[$i] eq $gids[$j] ) {
+		$gind[$i] = $j; } } }
+
+    return @gind;
+}
+
+
+### print_help_msg: prints help message for -h option ##########################
+
+sub print_help_msg {
+
+    print STDERR <<EOF
+
+USAGE: v [-a <accuracy>] [-b] [-c <geneID>] [-d <temp_class>] [-D] [-g <g(u)>] 
+         [-G] [-h] [-i <stepsize>] [-j <timefile>] [-o] [-O <output_mode>]
+         [-p <output_stepsize>] [-P <plotstyle>] [-r <RHS>] [-s <solver>]
+         [-S <size>] [-t <time>] [-v] [-X] [-y <ymin,ymax>] <datafile> [<genotype>]
+                                                                       
+DESCRIPTION: 
+ 
+ v is our viewer for data, model output (produced with unfold) and printscore
+ guts (produced with printscore -G).
+ 
+ v\'s default mode is to simply display unfold model output at gastrulation 
+ time, but it can display output for any arbitrary time (-t) as well as for 
+ series of time points either at regular intervals (-p) or arbitrary time
+ points read from a file (-j). Use -d to display data. -b includes the bcd
+ gradient into data or model graphs. -G displays squared differences between 
+ data and model at times for which we have data.
+
+ Use -c to choose a subset of genes to be displayed from a datafile. See below
+ for one-letter gene abbreviations.
+
+ v reads fly_sa\'s command line options from the \$version section of a data-
+ file by default. You can override settings for solver (-s), solver stepsize
+ (-i), solver-accuracy (-a), g(u) function (-g) and right-hand side of the
+ equation (-r) by using these command line options explicitly on the v command
+ line. You can also plot any arbitrary genotype supported by unfold (see un-
+ fold -h for details) by adding the genotype as a second argument. The default
+ genotype is the wild type.
+
+ v can output data in different plotting styles (-P), sizes (-S), with or 
+ without grid (-X) and write it to different formats (-O). It currently 
+ supports .fig, .gif (OSF1 only), LaTeX (bad quality), .png (Linux only)
+ and .tiff output.
+
+ Use -o to display oldstyle (protein concentration range 0...12) data and 
+ model output.
+
+OPTIONS: 
+
+    -a   sets accuracy for adaptive stepsize solvers for unfold; by default,
+         v will take the solver stepsize from the original fly_sa command
+         (saved in the \$version section of the datafile).
+    -b   include bcd in the graph of either data or model output.
+    -c   choose a subset of genes to plot, valid gene abbreviations are: 
+         
+             C       caudal	     cad
+             E       even-skipped    eve
+             F       fushi tarazu    ftz
+             G       giant	     gt
+             H       hunchback       hb
+             I       hairy           h
+             K       Kruppel         Kr
+             N       knirps          kni
+             O       odd-paired      odd
+             P       paired          prd
+             R       runt            run
+             S       sloppy-paired   slp
+             T       tailless        tll
+
+	 other possible arguments for -c are:
+ 
+          - gap      plots all gap genes present in the file
+          - pr       plots all pair rule genes present in the file
+
+         note: use -b to display bcd. 
+    -d   plot data: instead of running unfold on the chosen datafile, you
+         can also plot a specific time or temporal class for which there MUST
+         be data in the datafile. For valid temporal classes, see -t.
+    -D   runs v in debugging mode, i.e. it dumps the command it executes to run
+         the model, the temp time-, data- and scriptfile and other useful stuff
+         to STDOUT.
+    -g   choose g(u) to be used; valid g(u)\'s are e (exponential), h (heavi-
+         side), s (sqrt) and t (tanh); use this only if you know what you\'re
+         doing! By default, v will take the g(u) from the original fly_sa 
+         command (saved in the \$version section of the datafile). 
+    -G   plots printscore guts, i.e. the squared differences between data and 
+         model for each datapoint; -G will automatically display guts for all
+	 datatimes present in the datafile; if you don\'t like the fixed plot
+         limits that -G uses, you\'ll need to change the source code in the
+         get_ylimits() function (there\'s a big comment there).
+    -h   prints this help text (as you might have noticed).
+    -i   sets solver stepsize for unfold; by default, v will take the solver 
+         stepsize from the original fly_sa command (saved in the \$version 
+         section of the data file). 
+    -j   loads a timefile and plots model output for the times listed there;
+         timefiles are the same that can be used with unfold; they contain 
+         times separated by newlines (and nuthing else).
+    -o   plot oldstyle data, i.e. data with a range between 0 and about 12
+	 instead of the newstyle range between 0 and 255; note: this has 
+         nothing to do with -o for unfold and printscore which lets you choose
+	 and oldstyle division schedule; v reads its division schedule directly
+         from the original fly_sa command line in the \$version section of the 
+	 datafile; there is no override for this, since it doesn\'t make sense.
+    -O   output mode: by default, v plots to the screen (gnuplots X11 terminal);
+         alternatives are:
+
+         - fig         produce an xfig (.fig) file
+         - gif         plot to gif (only available on Tru64)
+    	 - latex       plot to latex, produces ahhful b/w plots, use it
+                           with -X only, otherwise it\'s really, really ugly
+    	 - png         plot to png (only available on Linux)
+         - tiff        plot to tiff
+
+	 Plots are saved in subdirectories called <datafile>_<output_mode>;
+         the tiff output mode requires ImageMagick\'s convert to work.
+    -p   plots output for every <stepsize> minutes; this is probably most 
+         useful in combination with the tiff output terminal  to produce large 
+         collections of plots that can be made into .qt movies (using makemovie 
+         on the AMS SGIs).
+    -P   set plot mode (lines, points or linespoints)
+    -q   which section should unfold read: i.e. input or eqparams
+    -r   choose a right-hand side of the model (not supported yet)
+    -s   choose the solver for unfold (overrides the -s command line option
+         from the \$version section of the datafile, which is used by default);
+         use unfold -h for a list of valid solvers. 
+    -S   choose output size (works for all output modes); valid sizes are:
+         tiny, small, medium, large and huge.
+    -t   plot model output for the specified time or temporal class; valid 
+         temporal classes are:
+ 
+            c10     cleavage cycle 10
+            c11     cleavage cycle 11
+            c12     cleavage cycle 12
+            c13     cleavage cycle 13
+            t1      cleavage cycle 14, temporal class 1
+            t2      cleavage cycle 14, temporal class 2
+            t3      cleavage cycle 14, temporal class 3
+            t4      cleavage cycle 14, temporal class 4
+            t5      cleavage cycle 14, temporal class 5
+            t6      cleavage cycle 14, temporal class 6
+            t7      cleavage cycle 14, temporal class 7
+            t8      cleavage cycle 14, temporal class 8
+
+         See source code (maternal.c) for a list of exact times for these tem-
+         poral classes.
+    -v   prints version number of v; all other options and arguments are ignored
+    -X   suppress grid in background of plots
+    -y   sets y-axis limits in the format: ymin,ymax
+
+ARGUMENTS:                                                            
+                                                                       
+ datafile:       file from which section should be extracted         
+ genotype:       genotype is optional, default is wt; see dataformatX.X
+
+REQUIREMENTS:
+ 
+ The v script is a wrapper around the 'unfold' and 'printscore' executables. 
+ Make sure you use the latest version of the fly code for v to function
+ properly.
+
+ v needs gnuplot for plotting. It was developed using gnuplot 3.7. The tiff
+ output terminal needs the ImageMagick convert program (5.1.1 was used for
+ developing v). I cannot and will not guarantee that v works with any other
+ version of these programs.
+
+AUTHORS
+
+ Johannes Jaeger (yoginho\@gmail.com)
+ Yousong Wang
+
+EOF
+
+}

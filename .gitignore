@@ -1,0 +1,49 @@
+# Object files
+*.o
+*.ko
+
+# Libraries
+*.lib
+*.a
+
+# Shared objects (inc. Windows DLLs)
+*.dll
+*.so
+*.so.*
+*.dylib
+
+# Executables
+*.exe
+*.out
+*.app
+
+# Output files
+*.fout
+*.out
+*.network
+*.csv
+
+# Media
+*.png
+*.eps
+*.pdf
+*.mpg
+
+# SublimeText
+*.sublime*
+
+# Directories
+jobs/
+input/
+output/
+doc/
+
+# Binaries
+fly/fly_ess
+fly/fly_ss
+fly/Makefile
+fly/printscore
+fly/scramble
+fly/unfold
+utils/gen_deviates
+	
